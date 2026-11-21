@@ -911,8 +911,10 @@
       setIcon("busy");
       result.then(
         () => {
+          /* Remembered, then painted at once, so the check mark already shows in red. */
           markDownloaded(key, story);
           button.classList.remove("busy");
+          button.repaint();
           setIcon("done");
           setTimeout(() => {
             setIcon(iconName);
@@ -2503,9 +2505,11 @@
     return targets;
   }
 
-  /* What a photo or video on the page is, for remembering its download: its media id, or for
-     a photo whose data isn't found, its file name. Kept per element and address, since looking
-     it up walks Instagram's data and buttons are painted on every scan. */
+  /* What a photo or video on the page is, for remembering its download: its media id; for a
+     video whose data isn't found (a story's often isn't), the id in the story's address or its
+     post's code, as the download itself uses; for such a photo, its file name. Kept per
+     element, address and page (a story's video element is reused for the next story), since
+     looking it up walks Instagram's data and buttons are painted on every scan. */
   const keyOfItem = item => {
     const pk = item?.pk || String(item?.id || "").split("_")[0];
     return pk ? "m:" + pk : null;
@@ -2513,12 +2517,18 @@
   const mediaKeys = new WeakMap();
   function mediaKey(media) {
     if (!media) return null;
-    const address = media.currentSrc || media.src || media.poster || "";
+    const source = media.currentSrc || media.src || media.poster || "";
+    const address = source + " " + location.pathname;
     const known = mediaKeys.get(media);
     if (known && known.address === address) return known.key;
-    const item = media.tagName === "VIDEO" ? findVideoItem(media) : findImageItem(media);
+    const video = media.tagName === "VIDEO";
+    const item = video ? findVideoItem(media) : findImageItem(media);
     let key = keyOfItem(item);
-    if (!key && media.tagName === "IMG" && address && !address.startsWith("blob:")) key = "f:" + fileOf(address);
+    if (!key && video) {
+      const pk = findMediaPk(media);
+      if (pk) key = "m:" + pk;
+    }
+    if (!key && !video && source && !source.startsWith("blob:")) key = "f:" + fileOf(source);
     mediaKeys.set(media, { address, key, story: isStoryPage() || isStoryItem(item, media) });
     return key;
   }
