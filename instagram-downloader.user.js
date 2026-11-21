@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         Instagram Downloader
-// @version      1.0
+// @version      1.1
 // @description  Adds download buttons to photos, videos, stories and profile pictures on Instagram.
 // @match        https://www.instagram.com/*
-// @grant        none
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
 // @sandbox      raw
 // @inject-into  page
 // @run-at       document-idle
@@ -47,6 +50,93 @@
   const AUTO_START = true;
   const APP_ID = "936619743392459";
   const HOST_TAG = "instagram-downloader";
+
+  /* ---------- What was downloaded ---------- */
+
+  /* Downloads are remembered, so their Download buttons turn Instagram's red (as a liked heart
+     does) and still download again when clicked: "m:<media id>" a photo or video (each photo of
+     a multi-photo post has its own), "f:<file>" a photo whose media id isn't known, "u:<username>"
+     a profile picture, "h:<highlight id>" a highlight's cover. A story is remembered for a day
+     (it is gone after that), anything else for good. They are kept in Tampermonkey's storage
+     when it is granted (it survives clearing Instagram's site data), one value per download,
+     "d:<key>", each the time it is forgotten or null for never; otherwise in IndexedDB. */
+  const DAY = 24 * 60 * 60 * 1000;
+  const STORE = "downloaded";
+  const downloaded = new Map();
+  const isDownloaded = key => {
+    if (!key || !downloaded.has(key)) return false;
+    const until = downloaded.get(key);
+    return until === null || until > Date.now();
+  };
+  const gm = typeof GM_getValue === "function" && typeof GM_setValue === "function" &&
+    typeof GM_listValues === "function" && typeof GM_deleteValue === "function";
+
+  /* Buttons that change colour once downloaded, painted again on every scan (a carousel's
+     button follows the photo shown) and once the saved downloads have been read. */
+  const paintable = new Set();
+  const repaintAll = () => {
+    for (const button of paintable) {
+      if (!button.isConnected && button.painted) paintable.delete(button);
+      else button.repaint();
+    }
+  };
+
+  const request = r => new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+
+  /* Reads every saved download, dropping those whose time is up; with Tampermonkey's storage,
+     anything left in IndexedDB is moved there and the database deleted. */
+  const database = (async () => {
+    const now = Date.now();
+    const keep = (key, until) => {
+      if (until !== null && until <= now) return false;
+      if (!downloaded.has(key)) downloaded.set(key, until);
+      return true;
+    };
+    let db = null;
+    try {
+      if (gm) {
+        for (const name of GM_listValues()) {
+          if (name.startsWith("d:") && !keep(name.slice(2), GM_getValue(name, null))) GM_deleteValue(name);
+        }
+      }
+      const open = indexedDB.open("instagramDownloader", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore(STORE);
+      db = await request(open);
+      const store = db.transaction(STORE, "readwrite").objectStore(STORE);
+      const keys = await request(store.getAllKeys());
+      const values = await request(store.getAll());
+      keys.forEach((key, index) => {
+        if (!keep(key, values[index])) store.delete(key);
+        else if (gm) GM_setValue("d:" + key, values[index]);
+      });
+      if (gm) {
+        db.close();
+        indexedDB.deleteDatabase("instagramDownloader");
+        db = null;
+      }
+    } catch (error) {
+      console.warn("[Instagram Downloader] couldn't read the list of downloads", error);
+    } finally {
+      repaintAll();
+    }
+    return db;
+  })();
+
+  function markDownloaded(key, story) {
+    if (!key) return;
+    const until = story ? Date.now() + DAY : null;
+    downloaded.set(key, until);
+    if (gm) {
+      GM_setValue("d:" + key, until);
+      return;
+    }
+    database.then(db => {
+      if (db) db.transaction(STORE, "readwrite").objectStore(STORE).put(until, key);
+    }).catch(error => console.warn("[Instagram Downloader] couldn't remember the download", error));
+  }
   const LAYER_TAG = "instagram-downloader-layer";
   const RESERVED_PATHS = ["explore", "reels", "direct", "stories", "accounts", "p", "reel", "tv", "about", "legal"];
 
@@ -723,6 +813,8 @@
     "button{all:unset;box-sizing:border-box;display:grid;place-items:center;cursor:pointer;color:inherit;",
     "transition:opacity .15s,background .15s,transform .1s}",
     "button:active{transform:scale(.88)}",
+    /* Downloaded already: Instagram's red, as a liked heart. */
+    "button.downloaded{color:#ff3040}",
     "button:focus-visible{outline:2px solid currentColor;outline-offset:2px}",
     "svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}",
     "button.busy svg{animation:spin .8s linear infinite}",
@@ -771,8 +863,10 @@
 
   /* A button that runs an action. While a returned promise is pending a spinner shows, then a
      check mark; an error is reported. Actions that return nothing (opening a tab) run inside
-     the click, so popup blockers allow them. */
-  function makeButton(win, iconName, label, action) {
+     the click, so popup blockers allow them. A download button gets done: { key, story }, two
+     functions naming what it saves (looked up each time: a carousel's button follows the photo
+     shown) and whether that is a story; once saved, the button turns red and stays so. */
+  function makeButton(win, iconName, label, action, done) {
     const doc = win.document;
     const button = doc.createElement("button");
     button.type = "button";
@@ -780,6 +874,22 @@
     button.setAttribute("aria-label", label);
     button.append(icon(doc, iconName));
     const setIcon = name => button.replaceChildren(icon(doc, name));
+    button.repaint = () => {
+      button.painted = true;
+      if (!done || button.classList.contains("busy")) return;
+      let key = null;
+      try {
+        key = done.key();
+      } catch (ignored) {}
+      const downloadedAlready = isDownloaded(key);
+      button.classList.toggle("downloaded", downloadedAlready);
+      button.title = downloadedAlready ? label + " · Downloaded, click to download again" : label;
+      button.setAttribute("aria-label", button.title);
+    };
+    if (done) {
+      paintable.add(button);
+      button.repaint();
+    }
     button.addEventListener("click", event => {
       event.preventDefault();
       if (button.classList.contains("busy")) return;
@@ -790,13 +900,24 @@
         result = Promise.reject(error);
       }
       if (!(result instanceof Promise)) return;
+      /* What is being saved, named now: a carousel may have moved on by the time it is done. */
+      let key = null;
+      let story = false;
+      try {
+        key = done?.key();
+        story = !!done?.story?.();
+      } catch (ignored) {}
       button.classList.add("busy");
       setIcon("busy");
       result.then(
         () => {
+          markDownloaded(key, story);
           button.classList.remove("busy");
           setIcon("done");
-          setTimeout(() => setIcon(iconName), 1200);
+          setTimeout(() => {
+            setIcon(iconName);
+            button.repaint();
+          }, 1200);
         },
         error => {
           button.classList.remove("busy");
@@ -809,7 +930,7 @@
   }
 
   /* A shadow-root host holding bars of buttons, so Instagram's styles can't change them.
-     bars: [[bar class, [[icon, label, action], …]], …]. */
+     bars: [[bar class, [[icon, label, action, done], …]], …]. */
   function makeHost(win, css, bars) {
     const doc = win.document;
     const host = doc.createElement(HOST_TAG);
@@ -820,7 +941,7 @@
     for (const [barClass, buttons] of bars) {
       const bar = doc.createElement("div");
       bar.className = "bar " + barClass;
-      for (const [iconName, label, action] of buttons) bar.append(makeButton(win, iconName, label, action));
+      for (const [iconName, label, action, done] of buttons) bar.append(makeButton(win, iconName, label, action, done));
       root.append(bar);
     }
     return host;
@@ -1398,9 +1519,10 @@
 
   /* ---------- Profile pictures ---------- */
 
-  /* The large profile picture on a profile page ("…'s profile picture", or its translation). */
+  /* The large profile picture on a profile page ("…'s profile picture", or its translation; on
+     the viewer's own profile "Change profile photo", or its translation). */
   function isAvatar(image) {
-    return /profile picture|profil resmi|foto del perfil|photo de profil|profilbild|immagine del profilo/i.test(image.alt || "") &&
+    return /profile (picture|photo)|profil (resmi|fotoğraf)|foto (del|de|do) perfil|photo de profil|profilbild|profilfoto|(immagine|foto) del profilo/i.test(image.alt || "") &&
       image.getBoundingClientRect().width >= 80 &&
       !!image.closest("header") && !image.closest(HIGHLIGHT_LINK);
   }
@@ -1599,6 +1721,7 @@
       width: item.original_width || image?.width || 0,
       height: item.original_height || image?.height || 0,
       taken: item.taken_at ? new Date(item.taken_at * 1000) : null,
+      key: keyOfItem(item),
     };
   }
 
@@ -1687,7 +1810,12 @@
       const blob = await fetchBlob(media.image);
       saveBlob(tab, blob, name + "." + extensionOf(blob.type));
     };
-    tile.save = save;
+    /* Saving from the tile's button or a "download all" button remembers it the same way. */
+    tile.save = async () => {
+      await save();
+      markDownloaded(media.key, story);
+      tile.querySelector(HOST_TAG)?.shadowRoot?.querySelectorAll("button").forEach(button => button.repaint?.());
+    };
     /* A video's first frame at the video's own resolution, from a copy of the video loaded with
        permission to read its pixels (CORS); failing that, Instagram's full-size cover image for
        the story. */
@@ -1718,7 +1846,7 @@
       ["open", "Open in new tab", openOne],
       ...(media.video && story ? [["frame", "Download first frame as a photo", saveFrame]] : []),
       ...(media.video && media.image && withCover ? [["cover", "Download cover", saveCover]] : []),
-      ["download", media.video ? "Download video" : "Download photo", save],
+      ["download", media.video ? "Download video" : "Download photo", save, media.key ? { key: () => media.key, story: () => story } : null],
     ]]]);
     tile.append(host);
 
@@ -2188,12 +2316,13 @@
     return "below-end";
   }
 
-  /* Icon buttons on the same frosted bar as the other floating bars: all posts when the viewer
-     can see them (withPosts), and all highlights when the profile has highlights (tray). */
-  function buildProfileBarHost(tray, withPosts) {
-    const buttons = withPosts ? [["stack", "All posts in a new tab, with every photo of multi-photo posts", () => openAllPosts()]] : [];
-    if (tray) buttons.push(["ring", "All highlights in a new tab", () => openAllHighlights(tray)]);
-    const host = makeHost(window, PILL_CSS, [["tab profile", buttons]]);
+  /* A one-button bar, on the same frosted pill as the other floating bars: all posts ("posts"), or
+     all highlights ("highlights") of the profile with that row of highlights (tray). */
+  function buildProfileBarHost(which, tray) {
+    const button = which === "posts"
+      ? ["stack", "All posts in a new tab, with every photo of multi-photo posts", () => openAllPosts()]
+      : ["ring", "All highlights in a new tab", () => openAllHighlights(tray)];
+    const host = makeHost(window, PILL_CSS, [["tab profile", [button]]]);
     isolateEvents(host);
     return host;
   }
@@ -2280,7 +2409,10 @@
     };
     const host = makeHost(window, ACTION_CSS, [[bar.layout === "column" ? "column" : "row", [
       ["open", "Open in new tab", withMedia(openMedia)],
-      ["download", "Download", withMedia(downloadMedia)],
+      ["download", "Download", withMedia(downloadMedia), {
+        key: () => mediaKey(mainMediaOf(bar.container)),
+        story: () => mediaIsStory(mainMediaOf(bar.container)),
+      }],
     ]]]);
     isolateEvents(host);
     return host;
@@ -2371,6 +2503,31 @@
     return targets;
   }
 
+  /* What a photo or video on the page is, for remembering its download: its media id, or for
+     a photo whose data isn't found, its file name. Kept per element and address, since looking
+     it up walks Instagram's data and buttons are painted on every scan. */
+  const keyOfItem = item => {
+    const pk = item?.pk || String(item?.id || "").split("_")[0];
+    return pk ? "m:" + pk : null;
+  };
+  const mediaKeys = new WeakMap();
+  function mediaKey(media) {
+    if (!media) return null;
+    const address = media.currentSrc || media.src || media.poster || "";
+    const known = mediaKeys.get(media);
+    if (known && known.address === address) return known.key;
+    const item = media.tagName === "VIDEO" ? findVideoItem(media) : findImageItem(media);
+    let key = keyOfItem(item);
+    if (!key && media.tagName === "IMG" && address && !address.startsWith("blob:")) key = "f:" + fileOf(address);
+    mediaKeys.set(media, { address, key, story: isStoryPage() || isStoryItem(item, media) });
+    return key;
+  }
+  const mediaIsStory = media => {
+    mediaKey(media);
+    return !!mediaKeys.get(media)?.story;
+  };
+  const mediaDone = media => ({ key: () => mediaKey(media), story: () => mediaIsStory(media) });
+
   /* Open, first frame (story videos only) and download, for one photo or video. A cover button
      is only on previews: tiles linking to their post, Reel tiles and the posts gallery. */
   function mediaButtons(media, kind) {
@@ -2381,7 +2538,7 @@
       ...(video && (kind.startsWith("story") || isStoryItem(findVideoItem(media), media))
         ? [["frame", "Download first frame as a photo", () => downloadFirstFrame(media)]] : []),
       ...(video && kind === "post" && isPreview(media) ? [["cover", "Download cover", () => downloadVideoCover(media)]] : []),
-      ["download", media.tagName === "VIDEO" ? "Download video" : "Download photo", () => downloadMedia(media)],
+      ["download", media.tagName === "VIDEO" ? "Download video" : "Download photo", () => downloadMedia(media), mediaDone(media)],
     ];
   }
 
@@ -2391,18 +2548,29 @@
     const bars = kind === "avatar"
       ? [
         ["avatar-left", [["open", "Open in new tab", () => openAvatar(media)]]],
-        ["avatar-right", [["download", "Download profile picture", () => downloadAvatar(media)]]],
+        ["avatar-right", [["download", "Download profile picture", () => downloadAvatar(media),
+          { key: () => "u:" + (profileOfPage() || "") }]]],
       ]
       : kind === "reelTile"
         ? [["post", [
           ["open", "Open in new tab", () => openReelTile(media)],
           ["cover", "Download cover", () => downloadReelTileCover(media)],
-          ["download", "Download video", () => downloadReelTile(media)],
+          ["download", "Download video", () => downloadReelTile(media), {
+            key: () => {
+              const code = media.getAttribute("href")?.match(/\/reel\/([A-Za-z0-9_-]+)/)?.[1];
+              return code ? "m:" + shortcodeToPk(code) : null;
+            },
+          }],
         ]]]
         : kind === "highlight"
         ? [
           ["avatar-left small", [["open", "Open cover in new tab", () => openHighlightCover(link)]]],
-          ["avatar-right small", [["download", "Download cover", () => downloadHighlightCover(link)]]],
+          ["avatar-right small", [["download", "Download cover", () => downloadHighlightCover(link), {
+            key: () => {
+              const id = link.getAttribute("href")?.match(/highlights\/(\d+)/)?.[1];
+              return id ? "h:" + id : null;
+            },
+          }]]],
         ]
         : [[kind.startsWith("story") ? "story column" : "post", mediaButtons(media, kind)]];
     const host = makeHost(window, PILL_CSS, bars);
@@ -2805,47 +2973,58 @@
           show(entry, anchor, "cover", 0, "");
         }
       }
-      /* The profile's Posts and Highlights bar, beside its row of highlight circles (or its
-         first tab, or its header, when it has no highlights) while nothing (a story or post window) covers it.
-         Where it goes is worked out once per anchor and width, so it doesn't move about. */
-      /* No Posts button on a private account the viewer doesn't follow, and no bar while that
-         isn't known yet, so it doesn't appear and then change. */
-      const tray = highlightTray();
-      const profileAnchor = tray || firstProfileTab() || profileHeader();
-      const access = profileAnchor ? canSeePosts(profileOfPage(), soon) : null;
-      const withPosts = access && headerSaysNoPosts() ? false : access;
-      const profileRect = profileAnchor && isNearScreen(profileAnchor) && isShown(profileAnchor, false) ? visibleRect(profileAnchor) : null;
-      if (profileAnchor && withPosts !== null && (withPosts || tray) && isNearScreen(profileAnchor) && isShown(profileAnchor, false) &&
-        (!profileRect || isUncovered(profileAnchor, ...centreOf(profileRect)))) {
-        current.add(profileAnchor);
-        let entry = entries.get(profileAnchor);
-        if (entry && entry.withPosts !== withPosts) {
-          entry.host.remove();
-          entries.delete(profileAnchor);
-          entry = null;
-        }
+      /* The profile's two bars, each beside what it opens: All highlights left of the row of
+         highlight circles, All posts left of the row of tabs (or of the header when there are no
+         tabs). When both are there, they are lined up in one column. Each is shown while nothing (a story or post
+         window) covers its anchor, and where it goes is worked out once per anchor and width,
+         so it doesn't move about. No Posts bar for an account without posts or a private account
+         the viewer doesn't follow, nor while that isn't known yet, so it doesn't appear and then
+         go away. */
+      const placeProfileBar = (which, anchor, tray, extraStyle) => {
+        const rect = isNearScreen(anchor) && isShown(anchor, false) ? visibleRect(anchor) : null;
+        if (!isNearScreen(anchor) || !isShown(anchor, false) || (rect && !isUncovered(anchor, ...centreOf(rect)))) return null;
+        current.add(anchor);
+        let entry = entries.get(anchor);
         if (!entry) {
-          entry = { kind: "profile", host: buildProfileBarHost(tray, withPosts), style: null, withPosts };
-          entries.set(profileAnchor, entry);
+          entry = { kind: "profile", host: buildProfileBarHost(which, tray), style: null };
+          entries.set(anchor, entry);
           layer.append(entry.host);
         }
-        const width = Math.round(profileAnchor.getBoundingClientRect().width);
-        if (entry.anchorWidth !== width && profileRect) {
+        const width = Math.round(anchor.getBoundingClientRect().width);
+        if (entry.anchorWidth !== width && rect) {
           entry.anchorWidth = width;
-          entry.profilePlacement = profileBarPlacement(profileAnchor, (withPosts ? 1 : 0) + (tray ? 1 : 0));
+          entry.profilePlacement = profileBarPlacement(anchor, 1);
         }
-        /* Beside the row, the bar is lined up with the middle of the circles, not of the circles
-           and their titles together. */
         const placement = entry.profilePlacement || "below-end";
+        /* Beside the row of highlights, the bar is lined up with the middle of the circles, not of
+           the circles and their titles together. */
         const circle = tray && (placement === "before" || placement === "end") ? tray.querySelector(HIGHLIGHT_LINK + " img") : null;
         const circleRect = circle?.getBoundingClientRect();
         const offset = circleRect?.height
           ? Math.max(0, Math.round((circleRect.top + circleRect.bottom) / 2 - tray.getBoundingClientRect().top - PROFILE_BAR.height / 2))
           : null;
-        show(entry, profileAnchor, placement, PROFILE_BAR.gap, offset === null
+        show(entry, anchor, placement, PROFILE_BAR.gap, (offset === null
           ? ";display:flex;align-items:center"
-          : ";display:flex;align-items:flex-start;box-sizing:border-box;padding-top:" + offset + "px");
+          : ";display:flex;align-items:flex-start;box-sizing:border-box;padding-top:" + offset + "px") + (extraStyle || ""));
+        return placement;
+      };
+      const tray = highlightTray();
+      const postsAnchor = firstProfileTab() || (tray ? null : profileHeader());
+      const access = postsAnchor ? canSeePosts(profileOfPage(), soon) : null;
+      const withPosts = !!postsAnchor && !!access && !headerSaysNoPosts();
+      /* Both bars left of their rows: the one whose row starts further right is moved left, so
+         the two stand in one column. */
+      const isBefore = anchor => (entries.get(anchor)?.profilePlacement || "before") === "before";
+      let trayShift = 0, postsShift = 0;
+      if (tray && withPosts && postsAnchor !== profileHeader() && isBefore(tray) && isBefore(postsAnchor)) {
+        const trayLeft = tray.getBoundingClientRect().left, postsLeft = postsAnchor.getBoundingClientRect().left;
+        const column = Math.min(trayLeft, postsLeft);
+        trayShift = Math.round(column - trayLeft);
+        postsShift = Math.round(column - postsLeft);
       }
+      const shiftStyle = shift => shift ? ";translate:" + shift + "px 0" : "";
+      if (tray) placeProfileBar("highlights", tray, tray, shiftStyle(trayShift));
+      if (withPosts) placeProfileBar("posts", postsAnchor, null, shiftStyle(postsShift));
 
       for (const [key, entry] of entries) {
         if (!key.isConnected) {
@@ -2968,7 +3147,10 @@
     }
 
     safeScan();
-    const timer = setInterval(safeScan, 400);
+    const timer = setInterval(() => {
+      safeScan();
+      repaintAll();
+    }, 400);
     return {
       stop() {
         clearInterval(timer);
