@@ -2652,6 +2652,10 @@
       ["download", "Download", withMedia(downloadMedia), {
         key: () => mediaKey(mainMediaOf(bar.container)),
         story: () => mediaIsStory(mainMediaOf(bar.container)),
+        details: () => {
+          const media = mainMediaOf(bar.container);
+          return media ? mediaDetails(media) : null;
+        },
       }],
     ]]]);
     isolateEvents(host);
