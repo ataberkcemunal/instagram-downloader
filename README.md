@@ -31,30 +31,6 @@ highlights and profile pictures, at the largest size Instagram has.
 3. Reload Instagram. If your browser blocks pop-ups on instagram.com, allow them: Open and the
    All posts / All highlights galleries open new tabs.
 
-### As a bookmarklet
-
-`instagram-downloader.js` also runs as a bookmarklet: create a bookmark whose address is
-`javascript:` followed by the file's contents. Each click turns the buttons on or off.
-
-## Development
-
-`instagram-downloader.js` is the source; the userscript is built from it:
-
-```bash
-node build.js
-```
-
-```bash
-node smoke-test.js instagram-downloader.js
-```
-
-To try changes without reinstalling, install `instagram-downloader-loader.user.js` instead:
-replace `/PATH/TO/instagram-downloader` in its `@require` line with the folder you cloned into,
-and in Tampermonkey's extension settings turn on "Allow access to file URLs". The loader then
-reads the built file from disk, so a rebuild takes effect after a page refresh.
-
-`eski-bookmarkletler/` holds earlier bookmarklet experiments.
-
 ## Note
 
 This project is not affiliated with Instagram or Meta. Respect the rights of the people whose

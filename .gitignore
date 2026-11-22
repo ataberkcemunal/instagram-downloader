@@ -1,1 +1,8 @@
 .DS_Store
+
+# Local development files (the repo holds only the userscript)
+instagram-downloader.js
+build.js
+smoke-test.js
+instagram-downloader-loader.user.js
+eski-bookmarkletler/
