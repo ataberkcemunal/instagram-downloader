@@ -30,13 +30,14 @@
  *                video plays.
  *   Open         Opens the media in its own tab. Click a photo to zoom; in a video tab,
  *                S saves the video and, for a story, F saves the first frame.
- *   Posts        On a profile, on a small bar beside its highlights: opens a tab with its
- *                posts as cards, each holding every photo and video of the post (all photos of
- *                a multi-photo post side by side) at full resolution. More load as the tab is
+ *   Posts        On a profile, a round button beside the Posts tab's icon: opens a tab with
+ *                its posts as cards, each holding every photo and video of the post (all photos
+ *                of a multi-photo post side by side) at full resolution. More load as the tab is
  *                scrolled; a switch shows only multi-photo posts.
- *   Highlights   On the same bar: opens a tab with every highlight, named after it, holding
- *                its uncropped cover and all its photos and videos at full resolution, each
- *                with open and download buttons (and first frame for videos).
+ *   Highlights   A circle ("All") first in the row of highlights: opens a tab with every
+ *                highlight, named after it, holding its uncropped cover and all its photos and
+ *                videos at full resolution, each with open and download buttons (and first
+ *                frame for videos).
  *
  * As a bookmarklet, each click turns the toolbars on or off. As a userscript (AUTO_START),
  * they appear on their own when Instagram loads.
@@ -174,7 +175,16 @@
   /* Text made safe for a file name: no characters file systems refuse, at most 60 characters. */
   const cleanName = text => (text || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
 
-  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  /* Waits in whichever window runs its timers sooner: this one or a tab of ours (a gallery).
+     Chrome slows down the timers of a tab in the background (after five minutes, to once a
+     minute), and the gallery and the Instagram tab it was opened from take turns being in front;
+     a gallery that waited on Instagram's timers alone stalled while it was being looked at. */
+  const waitIn = (tab, ms) => new Promise(resolve => {
+    setTimeout(resolve, ms);
+    try {
+      if (tab && !tab.closed) tab.setTimeout(resolve, ms);
+    } catch (ignored) {}
+  });
 
   function fetchBlob(url) {
     return fetch(url).then(response => {
@@ -788,6 +798,8 @@
     cover: ["M5 3.5h14A1.5 1.5 0 0 1 20.5 5v14a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V5A1.5 1.5 0 0 1 5 3.5z", "M10 8.6v6.8l5.4-3.4z"],
     /* A box with an arrow leaving its top right corner: open in a new tab. */
     open: ["M11 4.5H6.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V13", "M14.5 3.5h6v6", "m20.5 3.5-9 9"],
+    /* A bare arrow pointing up and right: the same, for the round All posts button. */
+    arrow: ["M6.5 17.5 17.5 6.5", "M8.5 6.5h9v9"],
     /* Two photos, one behind the other: all posts, with every photo of multi-photo posts. */
     stack: ["M8.5 7.5h10a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-10a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z", "M3.5 15.5v-10a2 2 0 0 1 2-2h10", "m6.5 17.5 3.8-3.8a1.5 1.5 0 0 1 2.1 0l4 4"],
     /* A highlight circle: all highlights. */
@@ -850,9 +862,11 @@
     ".bar.story{right:10px;top:50%;transform:translateY(-50%)}",
     ".bar.avatar-left{left:var(--dx,0px);bottom:var(--db,0px)}",
     ".bar.avatar-right{right:var(--dr,0px);bottom:var(--db,0px)}",
-    ".bar.small{padding:2px}",
-    ".bar.small button{width:26px;height:26px}",
-    ".bar.small svg{width:15px;height:15px}",
+    /* A highlight's circle: one small button centred on its bottom edge, half below it, so the
+       cover stays in sight. */
+    ".bar.highlight{left:50%;bottom:0;transform:translate(-50%,50%);padding:2px}",
+    ".bar.highlight button{width:28px;height:28px}",
+    ".bar.highlight svg{width:16px;height:16px}",
     ".bar.tab{position:static}",
     ".bar.profile button{width:30px;height:30px}",
     ".bar.profile svg{width:17px;height:17px}",
@@ -1591,10 +1605,8 @@
      names the same file, uncropped and at full size, as its preview image (og:image). That is
      used when it is the same file as the circle's; otherwise the circle's own picture. */
   const highlightCovers = new Map();
-  function highlightCoverUrl(link) {
-    const id = link.getAttribute("href").match(/highlights\/(\d+)/)?.[1];
-    const image = link.querySelector("img");
-    const shown = image ? largestImageUrl(image, null) : null;
+  const highlightIdOf = link => link.getAttribute("href")?.match(/highlights\/(\d+)/)?.[1] || null;
+  function highlightCoverUrl(id, shown) {
     if (!id) return Promise.resolve(shown);
     if (!highlightCovers.has(id)) {
       highlightCovers.set(id, fetch("/stories/highlights/" + id + "/", { credentials: "include" })
@@ -1615,17 +1627,11 @@
     return (await fileBase(username, null)) + " highlight" + (title ? " " + title : "");
   }
 
-  async function downloadHighlightCover(link) {
-    const url = await highlightCoverUrl(link);
-    if (!url) throw new Error("Couldn't find this highlight's cover.");
-    const blob = await fetchBlob(url);
-    saveBlob(window, blob, (await highlightFileBase(link)) + " cover " + fileStamp() + "." + extensionOf(blob.type));
-  }
-
   function openHighlightCover(link) {
     const tab = openLoadingTab();
     if (!tab) return;
-    Promise.all([highlightCoverUrl(link), highlightFileBase(link)])
+    const image = link.querySelector("img");
+    Promise.all([highlightCoverUrl(highlightIdOf(link), image ? largestImageUrl(image, null) : null), highlightFileBase(link)])
       .then(([url, base]) => showImageUrl(tab, url, base + " cover"));
   }
 
@@ -1648,13 +1654,13 @@
   /* The session tokens, from the page's own scripts or, failing that, from a fresh copy of the
      home page. */
   let sessionTokens = null;
-  async function pageTokens() {
+  async function pageTokens(fresh = false) {
     const find = text => ({
       dtsg: text.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/)?.[1] || null,
       lsd: text.match(/"LSD",\[\],\{"token":"([^"]+)"/)?.[1] || null,
     });
-    if (!sessionTokens?.dtsg) {
-      let tokens = find([...document.scripts].map(script => script.textContent).join("\n"));
+    if (fresh || !sessionTokens?.dtsg) {
+      let tokens = fresh ? { dtsg: null } : find([...document.scripts].map(script => script.textContent).join("\n"));
       if (!tokens.dtsg) tokens = find(await fetch("/", { credentials: "include" }).then(response => response.text()).catch(() => ""));
       sessionTokens = tokens;
     }
@@ -1662,11 +1668,38 @@
   }
 
   /* Runs one of Instagram's GraphQL queries and returns its connection (edges and page_info).
-     Busy answers (429, server errors) are retried twice after a longer pause. what names the
-     content in error messages. */
-  async function graphqlConnection(query, variables, what) {
-    const { dtsg, lsd } = await pageTokens();
-    if (!dtsg) throw new Error("Couldn't read Instagram's session. Reload the page and try again.");
+     Busy answers (429, server errors) are retried twice after a longer pause (waiting in tab as
+     well, see waitIn). Any other failure is retried once with fresh session tokens, as the ones
+     read earlier may have expired while the page stayed open. what names the content in error
+     messages. */
+  async function graphqlConnection(query, variables, what, tab = null) {
+    let refreshed = false;
+    for (let attempt = 0; ; attempt++) {
+      const { dtsg, lsd } = await pageTokens(refreshed);
+      if (!dtsg) throw new Error("Couldn't read Instagram's session. Reload the page and try again.");
+      const response = await graphqlRequest(query, variables, dtsg, lsd).catch(() => null);
+      let data = null;
+      try {
+        data = response ? JSON.parse(await response.text()) : null;
+      } catch (error) {}
+      const connection = data?.data?.[query.root];
+      if (connection?.edges) return connection;
+      const status = response?.status || 0;
+      if (attempt < 2 && (status === 429 || status >= 500)) {
+        await waitIn(tab, 10000 * (attempt + 1));
+        continue;
+      }
+      if (!refreshed && status !== 429) {
+        refreshed = true;
+        continue;
+      }
+      throw new Error(status === 429
+        ? "Instagram is refusing requests for a while (too many). Try again in a few minutes."
+        : "Instagram didn't return " + what + (data?.errors?.[0]?.summary ? " (" + data.errors[0].summary + ")" : "") + ".");
+    }
+  }
+
+  function graphqlRequest(query, variables, dtsg, lsd) {
     const body = new URLSearchParams({
       fb_dtsg: dtsg,
       lsd: lsd || "",
@@ -1683,33 +1716,18 @@
       "X-FB-Friendly-Name": query.name,
       ...(lsd ? { "X-FB-LSD": lsd } : {}),
     };
-    for (let attempt = 0; ; attempt++) {
-      const response = await fetch("/graphql/query", { method: "POST", credentials: "include", headers, body });
-      let data = null;
-      try {
-        data = JSON.parse(await response.text());
-      } catch (error) {}
-      const connection = data?.data?.[query.root];
-      if (connection?.edges) return connection;
-      if (attempt < 2 && (response.status === 429 || response.status >= 500)) {
-        await wait(10000 * (attempt + 1));
-        continue;
-      }
-      throw new Error(response.status === 429
-        ? "Instagram is refusing requests for a while (too many). Try again in a few minutes."
-        : "Instagram didn't return " + what + (data?.errors?.[0]?.summary ? " (" + data.errors[0].summary + ")" : "") + ".");
-    }
+    return fetch("/graphql/query", { method: "POST", credentials: "include", headers, body });
   }
 
   /* The highlights with these ids, each with its title and stories, in the order asked. */
-  async function fetchHighlightReels(ids) {
+  async function fetchHighlightReels(ids, tab) {
     const reelIds = ids.map(id => "highlight:" + id);
     const connection = await graphqlConnection(HIGHLIGHTS_QUERY, {
       initial_reel_id: reelIds[0],
       reel_ids: reelIds,
       first: reelIds.length,
       __relay_internal__pv__PolarisCommunityNoteStoriesLabelEnabledrelayprovider: true,
-    }, "these highlights");
+    }, "these highlights", tab);
     return connection.edges.map(edge => edge.node);
   }
 
@@ -1725,6 +1743,23 @@
       taken: item.taken_at ? new Date(item.taken_at * 1000) : null,
       key: keyOfItem(item),
     };
+  }
+
+  /* Every highlight of the profile, as Instagram lists them: id, title and cropped cover, in the
+     profile's order. The row on the page can't be relied on for this: it holds only the circles
+     in sight and a few around them. null if Instagram doesn't answer. */
+  async function fetchHighlightList(username) {
+    const id = (await profileInfo(username))?.id;
+    if (!id) return null;
+    const response = await fetch("/api/v1/highlights/" + id + "/highlights_tray/",
+      { credentials: "include", headers: { "X-IG-App-ID": APP_ID } });
+    const tray = response.ok ? (await response.json())?.tray : null;
+    if (!Array.isArray(tray)) return null;
+    return tray.map(reel => ({
+      id: String(reel.id || "").replace(/^highlight:/, ""),
+      title: reel.title || "",
+      picture: reel.cover_media?.cropped_image_version?.url || null,
+    })).filter(reel => /^\d+$/.test(reel.id));
   }
 
   /* The profile's highlight circles, one per highlight, in the order shown. */
@@ -1931,7 +1966,7 @@
         } catch (error) {
           failed++;
         }
-        await wait(400);
+        await waitIn(tab, 400);
       }
       if (failed) throw new Error(failed + " of " + all.length + " files couldn't be downloaded.");
     }]]]]);
@@ -1955,7 +1990,6 @@
      are loaded a few at a time, in order, so Instagram isn't flooded with requests. */
   function openAllHighlights(tray) {
     const links = highlightLinksIn(tray);
-    if (!links.length) return;
     const tab = openLoadingTab();
     if (!tab) return;
     const username = profileOfPage() || "instagram";
@@ -1966,17 +2000,31 @@
     const base = await fileBase(username, null);
     if (tab.closed) return;
     const { doc, main, status } = galleryPage(tab, username + " · Highlights", base + " · Highlights");
+    status.textContent = "Loading the list of highlights…";
+
+    /* The highlights Instagram lists, then any circle on the page it didn't list; only the
+       circles on the page if it doesn't answer. */
+    const shown = links.map(link => {
+      const circle = link.querySelector("img");
+      return {
+        id: highlightIdOf(link),
+        title: (link.textContent || "").trim(),
+        picture: circle ? largestImageUrl(circle, null) || circle.currentSrc || circle.src : null,
+      };
+    }).filter(reel => reel.id);
+    const listed = await fetchHighlightList(username).catch(() => null);
+    if (tab.closed) return;
+    const reels = listed?.length ? [...listed, ...shown.filter(reel => !listed.some(item => item.id === reel.id))] : shown;
+    if (!reels.length) {
+      status.textContent = "Couldn't find this profile's highlights. Reload the page and try again.";
+      return;
+    }
 
     /* Every section is laid out at once, in the profile's order, and filled in as its highlight
        arrives. */
-    const sections = links.map(link => {
-      const circle = link.querySelector("img");
-      const entry = gallerySection(doc, main, {
-        picture: circle ? circle.currentSrc || circle.src : null,
-        title: (link.textContent || "").trim() || "Highlight",
-        sub: "Waiting…",
-      });
-      return { ...entry, id: link.getAttribute("href").match(/highlights\/(\d+)/)[1], link };
+    const sections = reels.map(reel => {
+      const entry = gallerySection(doc, main, { picture: reel.picture, title: reel.title || "Highlight", sub: "Waiting…" });
+      return { ...entry, id: reel.id, picture: reel.picture };
     });
 
     let stories = 0;
@@ -1987,7 +2035,7 @@
       for (const entry of batch) entry.count.textContent = "Loading…";
       let nodes;
       try {
-        nodes = await fetchHighlightReels(batch.map(entry => entry.id));
+        nodes = await fetchHighlightReels(batch.map(entry => entry.id), tab);
       } catch (error) {
         for (const entry of sections.slice(start)) entry.count.textContent = "Not loaded";
         throw error;
@@ -2002,10 +2050,10 @@
         /* The uncropped cover comes from the highlight's own page: one more request each. */
         const coverName = base + " highlight" + (cleanName(node.title) ? " " + cleanName(node.title) : "") + " cover";
         const fallback = node.cover_media?.cropped_image_version?.url || null;
-        const coverUrl = (await highlightCoverUrl(entry.link)) || fallback;
+        const coverUrl = (await highlightCoverUrl(entry.id, entry.picture || fallback)) || fallback;
         if (coverUrl && !tab.closed) entry.grid.prepend(mediaTile(tab, { image: coverUrl }, coverName, "Cover"));
       }
-      if (start + HIGHLIGHTS_PER_REQUEST < sections.length) await wait(HIGHLIGHTS_PAUSE);
+      if (start + HIGHLIGHTS_PER_REQUEST < sections.length) await waitIn(tab, HIGHLIGHTS_PAUSE);
     }
     status.textContent = sections.length + (sections.length === 1 ? " highlight · " : " highlights · ") +
       stories + (stories === 1 ? " story" : " stories") + ". Click a photo to open it; hover for download buttons.";
@@ -2045,7 +2093,7 @@
   };
   const POSTS_PAUSE = 1200;
 
-  function fetchPostsPage(username, after) {
+  function fetchPostsPage(username, after, tab) {
     return graphqlConnection(POSTS_QUERY, {
       after,
       before: null,
@@ -2065,7 +2113,7 @@
       __relay_internal__pv__PolarisSEOIsCrawlerrelayprovider: false,
       __relay_internal__pv__PolarisThreadsStyleCommentsEnabledrelayprovider: false,
       __relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider: false,
-    }, "this profile's posts");
+    }, "this profile's posts", tab);
   }
 
   /* Opens a tab with the profile's posts, newest first (pinned posts first, as on the profile): a
@@ -2108,13 +2156,13 @@
     for (let page = 0; ; page++) {
       if (tab.closed) return;
       while (page > 0 && !nearEnd()) {
-        await wait(300);
+        await waitIn(tab, 300);
         if (tab.closed) return;
       }
       end.textContent = "Loading more posts…";
       let connection;
       try {
-        connection = await fetchPostsPage(username, after);
+        connection = await fetchPostsPage(username, after, tab);
       } catch (error) {
         end.textContent = "";
         if (!posts) throw error;
@@ -2132,7 +2180,7 @@
       after = connection.page_info?.end_cursor || null;
       if (!connection.page_info?.has_next_page || !after) break;
       end.textContent = "";
-      await wait(POSTS_PAUSE);
+      await waitIn(tab, POSTS_PAUSE);
     }
     end.textContent = posts ? "That's all the posts." : "This profile has no posts that can be shown.";
   }
@@ -2258,20 +2306,31 @@
     if (!username) return true;
     if (profileAccess.has(username)) return profileAccess.get(username);
     profileAccess.set(username, null);
-    (async () => {
-      try {
-        const response = await fetch("/api/v1/users/web_profile_info/?username=" + encodeURIComponent(username),
-          { credentials: "include", headers: { "X-IG-App-ID": APP_ID } });
-        const user = response.ok ? (await response.json())?.data?.user : null;
-        const viewer = document.cookie.match(/(?:^|;\s*)ds_user_id=(\d+)/)?.[1];
-        const open = !user || !user.is_private || !!user.followed_by_viewer || user.id === viewer;
-        profileAccess.set(username, open && user?.edge_owner_to_timeline_media?.count !== 0);
-      } catch (error) {
-        profileAccess.set(username, true);
-      }
+    profileInfo(username).then(user => {
+      const viewer = document.cookie.match(/(?:^|;\s*)ds_user_id=(\d+)/)?.[1];
+      const open = !user || !user.is_private || !!user.followed_by_viewer || user.id === viewer;
+      profileAccess.set(username, open && user?.edge_owner_to_timeline_media?.count !== 0);
       done();
-    })();
+    });
     return null;
+  }
+
+  /* What Instagram says about a profile (its id, whether it is private...), asked once per
+     profile; null if it doesn't answer. A failed answer isn't kept, so it is asked again later. */
+  const profileInfos = new Map();
+  function profileInfo(username) {
+    if (!profileInfos.has(username)) {
+      const answer = fetch("/api/v1/users/web_profile_info/?username=" + encodeURIComponent(username),
+        { credentials: "include", headers: { "X-IG-App-ID": APP_ID } })
+        .then(response => response.ok ? response.json() : null)
+        .then(data => data?.data?.user || null)
+        .catch(() => null);
+      profileInfos.set(username, answer);
+      answer.then(user => {
+        if (!user) profileInfos.delete(username);
+      });
+    }
+    return profileInfos.get(username);
   }
 
   /* Whether the profile's header shows a post count of 0 ("0 posts", "0 gönderi"): the first line
@@ -2284,15 +2343,17 @@
   }
 
   /* The first (leftmost) of the profile's tabs (posts, reels, tagged...), found through the
-     nearest element holding the links of at least two of the tabs after the first. The row of
-     tabs itself can be as wide as the grid, far wider than the tabs. */
+     nearest element holding the tab links outside the header (the posts tab and at least one
+     other; an account may have only Posts and Tagged). The row of tabs itself can be as wide as
+     the grid, far wider than the tabs. */
   function firstProfileTab() {
     const username = profileOfPage();
     if (isStoryPage() || !username) return null;
     const prefix = "/" + username.toLowerCase() + "/";
     const links = [...document.querySelectorAll("main a[href]")].filter(link => {
       const path = link.pathname.toLowerCase();
-      return path.startsWith(prefix) && PROFILE_TABS.includes(path.slice(prefix.length).replace(/\/$/, ""));
+      return path.startsWith(prefix) && !link.closest("header") && link.getBoundingClientRect().width > 0 &&
+        ["", ...PROFILE_TABS].includes(path.slice(prefix.length).replace(/\/$/, ""));
     });
     if (links.length < 2) return null;
     let common = links[0].parentElement;
@@ -2327,6 +2388,120 @@
     const host = makeHost(window, PILL_CSS, [["tab profile", [button]]]);
     isolateEvents(host);
     return host;
+  }
+
+  /* All highlights: a circle like a highlight's, first in the row of highlights. Its size,
+     colours and title's font are read from the first highlight (allHighlightsLook), so it looks
+     like one. Its title follows the page's language. */
+  const ALL_HIGHLIGHTS_CSS = BUTTON_CSS + [
+    ":host{all:initial;position:absolute;left:0;top:0;bottom:0;width:var(--w,125px)}",
+    "button{display:flex;flex-direction:column;align-items:center;width:100%;padding-top:var(--top,10px);gap:var(--gap,15px);color:var(--fg,#000)}",
+    "button:active{transform:scale(.94)}",
+    ".circle{display:grid;place-items:center;width:var(--size,77px);height:var(--size,77px);border-radius:50%;",
+    "background:var(--bg,rgba(128,128,128,.12));transition:opacity .15s}",
+    "button:hover .circle{opacity:.7}",
+    ".circle svg{width:calc(var(--size,77px) * .36);height:calc(var(--size,77px) * .36);stroke-width:1.7}",
+    ".title{font:var(--font,600 12px/16px -apple-system,system-ui,sans-serif);white-space:nowrap}",
+  ].join("");
+  function buildAllHighlightsHost() {
+    const host = document.createElement(HOST_TAG);
+    const root = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = ALL_HIGHLIGHTS_CSS;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.title = "All highlights in a new tab";
+    button.setAttribute("aria-label", button.title);
+    const circle = document.createElement("span");
+    circle.className = "circle";
+    circle.append(icon(document, "open"));
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = /^tr\b/i.test(document.documentElement.lang) ? "T\u00fcm\u00fc" : "All";
+    button.append(circle, title);
+    button.addEventListener("click", event => {
+      event.preventDefault();
+      const tray = highlightTray();
+      if (tray) openAllHighlights(tray);
+    });
+    root.append(style, button);
+    isolateEvents(host);
+    return host;
+  }
+
+  /* The first highlight's measures and colours, as the circle's custom properties: the width of
+     its place in the row, the circle's size (with the ring Instagram draws a little outside the
+     cover), its distance from the top of the frame and from the title, its background, and the
+     title's colour and font. */
+  function allHighlightsLook(link, frame) {
+    const cover = link.querySelector("img");
+    const item = link.closest("li");
+    if (!cover || !item) return null;
+    const coverRect = cover.getBoundingClientRect();
+    const itemRect = item.getBoundingClientRect();
+    if (!coverRect.width || !itemRect.width) return null;
+    const ring = Math.max(0, Math.min(8, Math.round(coverRect.left - link.getBoundingClientRect().left)));
+    let background = null;
+    for (let node = cover.parentElement; node && node !== link && !background; node = node.parentElement) {
+      const color = getComputedStyle(node).backgroundColor;
+      if (color !== "transparent" && !/^rgba\(.*,\s*0\)$/.test(color)) background = color;
+    }
+    const parts = [
+      "--w:" + Math.round(itemRect.width) + "px",
+      "--top:" + Math.max(0, Math.round(coverRect.top - ring - frame.getBoundingClientRect().top)) + "px",
+      "--size:" + Math.round(coverRect.width + 2 * ring) + "px",
+    ];
+    if (background) parts.push("--bg:" + background);
+    const title = [...link.querySelectorAll("span")].find(span => !span.children.length && span.textContent.trim());
+    if (title) {
+      const style = getComputedStyle(title);
+      parts.push("--gap:" + Math.max(0, Math.round(title.getBoundingClientRect().top - coverRect.bottom - ring)) + "px",
+        "--fg:" + style.color, "--font:" + style.fontWeight + " " + style.fontSize + "/" + style.lineHeight + " " + style.fontFamily);
+    }
+    return { width: Math.round(itemRect.width), style: ";" + parts.join(";") };
+  }
+
+  /* Where the circle goes: the frame around the row of highlights and its arrows, the nearest
+     element above the scrolling row that holds nothing else and is as wide as it. The frame gets
+     room on its left and the circle is put there, so the row and its arrows become narrower by
+     one place: the circle stays put while the highlights scroll, and Instagram's arrows, which
+     work out how far the row scrolls from its width, still reach its end. */
+  function allHighlightsFrame(tray) {
+    const width = tray.getBoundingClientRect().width;
+    let node = tray.parentElement;
+    for (let level = 0; node && node !== document.body && level < 4; node = node.parentElement, level++) {
+      const children = [...node.children].filter(child => child.tagName.toLowerCase() !== HOST_TAG);
+      const style = getComputedStyle(node);
+      /* Its width without the room already made for the circle. */
+      const inner = node.getBoundingClientRect().width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      if (children.length === 1 && style.display === "block" && Math.abs(inner - width) <= 2) return node;
+    }
+    return null;
+  }
+
+  /* All posts: a round button with an arrow just right of the Posts tab's icon, in its colour on
+     a light shade of it (so it suits the dark theme as well). */
+  const POSTS_BUTTON_CSS = BUTTON_CSS + [
+    ":host{all:initial}",
+    ".bar{display:flex;pointer-events:auto}",
+    "button{width:30px;height:30px;border-radius:50%;background:color-mix(in srgb,currentColor 10%,transparent)}",
+    "button:hover{background:color-mix(in srgb,currentColor 18%,transparent)}",
+    "svg{width:16px;height:16px;stroke-width:2.2}",
+  ].join("");
+  function buildPostsButtonHost() {
+    const host = makeHost(window, POSTS_BUTTON_CSS,
+      [["", [["arrow", "All posts in a new tab, with every photo of multi-photo posts", () => openAllPosts()]]]]);
+    isolateEvents(host);
+    return host;
+  }
+
+  /* The Posts tab's icon: the first tab, if it is the one leading to the profile's own address. */
+  function postsTabIcon() {
+    const tab = firstProfileTab();
+    const username = profileOfPage();
+    if (!tab || !username) return null;
+    if (tab.pathname.toLowerCase().replace(/\/$/, "") !== "/" + username.toLowerCase()) return null;
+    return tab.querySelector("svg") || tab;
   }
 
   /* ---------- Buttons next to Save ---------- */
@@ -2552,8 +2727,9 @@
     ];
   }
 
-  /* The profile picture, and a highlight's circle (with smaller buttons), get open in the bottom
-     left corner and download in the bottom right; other media get one bar. */
+  /* The profile picture gets open in the bottom left corner and download in the bottom right; a
+     highlight's circle gets only open, on its bottom edge, as its cover is best looked at before
+     it is saved (the tab has a download button); other media get one bar. */
   function buildFloatingHost(media, kind, link) {
     const bars = kind === "avatar"
       ? [
@@ -2573,15 +2749,7 @@
           }],
         ]]]
         : kind === "highlight"
-        ? [
-          ["avatar-left small", [["open", "Open cover in new tab", () => openHighlightCover(link)]]],
-          ["avatar-right small", [["download", "Download cover", () => downloadHighlightCover(link), {
-            key: () => {
-              const id = link.getAttribute("href")?.match(/highlights\/(\d+)/)?.[1];
-              return id ? "h:" + id : null;
-            },
-          }]]],
-        ]
+        ? [["highlight", [["open", "Open cover in new tab (download it there)", () => openHighlightCover(link)]]]]
         : [[kind.startsWith("story") ? "story column" : "post", mediaButtons(media, kind)]];
     const host = makeHost(window, PILL_CSS, bars);
     isolateEvents(host);
@@ -2771,6 +2939,7 @@
        above   just above it, centred (buttons at the top of the Reels column);
        below   just below it, centred (a story's buttons under its last control);
        outside from its top, 12 px right of a second element (a story's buttons beside its card);
+       side    just right of it, centred on it (All posts beside the Posts tab's icon);
        end     inside its right end, as tall as it (the profile's Posts and Highlights bar);
        above-end / below-end  just above or below it, lined up with its right edge.
      gap is the space between the host and the anchor. */
@@ -2794,6 +2963,10 @@
     }
     if (placement === "outside") {
       return common + "left:anchor(" + secondName + " right," + far + ");top:anchor(top," + far + ");margin-left:12px";
+    }
+    if (placement === "side") {
+      return common + "left:anchor(right," + far + ");top:anchor(center," + far + ");transform:translateY(-50%);" +
+        "margin-left:" + gap + "px";
     }
     if (placement === "end") {
       return common + "right:anchor(right," + far + ");top:anchor(top," + far + ");height:anchor-size(height,0px);" +
@@ -2825,6 +2998,9 @@
     }
     if (placement === "outside") {
       return common + "left:" + (second.getBoundingClientRect().right + 12) + "px;top:" + rect.top + "px";
+    }
+    if (placement === "side") {
+      return common + "left:" + (rect.right + gap) + "px;top:" + (rect.top + rect.height / 2) + "px;transform:translateY(-50%)";
     }
     if (placement === "end") {
       return common + "right:" + (innerWidth - rect.right + gap) + "px;top:" + rect.top + "px;height:" + rect.height + "px";
@@ -2983,13 +3159,14 @@
           show(entry, anchor, "cover", 0, "");
         }
       }
-      /* The profile's two bars, each beside what it opens: All highlights left of the row of
-         highlight circles, All posts left of the row of tabs (or of the header when there are no
-         tabs). When both are there, they are lined up in one column. Each is shown while nothing (a story or post
-         window) covers its anchor, and where it goes is worked out once per anchor and width,
-         so it doesn't move about. No Posts bar for an account without posts or a private account
-         the viewer doesn't follow, nor while that isn't known yet, so it doesn't appear and then
-         go away. */
+      /* The profile's All highlights and All posts buttons, each on what it opens: a circle
+         first in the row of highlights, and a round button beside the Posts tab's icon. Where
+         that can't be done (Instagram's layout has changed, or there are no tabs), a small bar
+         beside the row of highlights, the row of tabs or the header. No All posts button for an
+         account without posts or a private account the viewer doesn't follow, nor while that
+         isn't known yet, so it doesn't appear and then go away. A bar is shown while nothing (a
+         story or post window) covers its anchor, and where it goes is worked out once per anchor
+         and width, so it doesn't move about. */
       const placeProfileBar = (which, anchor, tray, extraStyle) => {
         const rect = isNearScreen(anchor) && isShown(anchor, false) ? visibleRect(anchor) : null;
         if (!isNearScreen(anchor) || !isShown(anchor, false) || (rect && !isUncovered(anchor, ...centreOf(rect)))) return null;
@@ -3020,25 +3197,69 @@
       };
       const tray = highlightTray();
       const postsAnchor = firstProfileTab() || (tray ? null : profileHeader());
-      const access = postsAnchor ? canSeePosts(profileOfPage(), soon) : null;
-      const withPosts = !!postsAnchor && !!access && !headerSaysNoPosts();
-      /* Both bars left of their rows: the one whose row starts further right is moved left, so
-         the two stand in one column. */
-      const isBefore = anchor => (entries.get(anchor)?.profilePlacement || "before") === "before";
-      let trayShift = 0, postsShift = 0;
-      if (tray && withPosts && postsAnchor !== profileHeader() && isBefore(tray) && isBefore(postsAnchor)) {
-        const trayLeft = tray.getBoundingClientRect().left, postsLeft = postsAnchor.getBoundingClientRect().left;
-        const column = Math.min(trayLeft, postsLeft);
-        trayShift = Math.round(column - trayLeft);
-        postsShift = Math.round(column - postsLeft);
+      const onProfile = !!(tray || postsAnchor || profileHeader());
+      const access = onProfile ? canSeePosts(profileOfPage(), soon) : null;
+      const withPosts = !!access && !headerSaysNoPosts() && !!(postsAnchor || profileHeader());
+
+      /* The circle goes into Instagram's own page, in the frame around the row of highlights, so
+         it is covered by whatever covers them. It is put back only when it isn't in place, as
+         moving it is a change of the page that starts another scan. It is measured again only
+         while no highlight is pointed at, as Instagram may enlarge that one. The frame's own
+         style is put back when the circle goes. */
+      const frame = tray ? allHighlightsFrame(tray) : null;
+      const firstHighlight = tray?.querySelector(HIGHLIGHT_LINK);
+      if (frame && firstHighlight) {
+        current.add(frame);
+        let entry = entries.get(frame);
+        if (!entry) {
+          const host = buildAllHighlightsHost();
+          const saved = { paddingLeft: frame.style.paddingLeft, position: frame.style.position };
+          entry = {
+            kind: "allHighlights", host, style: null, restore: () => {
+              host.remove();
+              frame.style.paddingLeft = saved.paddingLeft;
+              frame.style.position = saved.position;
+            },
+          };
+          entries.set(frame, entry);
+        }
+        if (frame.firstElementChild !== entry.host) frame.prepend(entry.host);
+        if (!hoveredHighlight || !entry.look) entry.look = allHighlightsLook(firstHighlight, frame) || entry.look;
+        const look = entry.look;
+        if (look) {
+          if (frame.style.paddingLeft !== look.width + "px") frame.style.paddingLeft = look.width + "px";
+          if (getComputedStyle(frame).position === "static") frame.style.position = "relative";
+          if (entry.style !== look.style) {
+            entry.host.style.cssText = look.style;
+            entry.style = look.style;
+          }
+        }
+      } else if (tray) {
+        placeProfileBar("highlights", tray, tray, "");
       }
-      const shiftStyle = shift => shift ? ";translate:" + shift + "px 0" : "";
-      if (tray) placeProfileBar("highlights", tray, tray, shiftStyle(trayShift));
-      if (withPosts) placeProfileBar("posts", postsAnchor, null, shiftStyle(postsShift));
+
+      if (withPosts) {
+        const postsIcon = postsTabIcon();
+        const rect = postsIcon && isNearScreen(postsIcon) && isShown(postsIcon, false) ? visibleRect(postsIcon) : null;
+        if (postsIcon && (!rect || isUncovered(postsIcon, ...centreOf(rect)))) {
+          current.add(postsIcon);
+          let entry = entries.get(postsIcon);
+          if (!entry) {
+            entry = { kind: "postsButton", host: buildPostsButtonHost(), style: null };
+            entries.set(postsIcon, entry);
+            layer.append(entry.host);
+          }
+          show(entry, postsIcon, "side", 8, ";color:" + getComputedStyle(postsIcon).color);
+        } else if (!postsIcon) {
+          const postsBarAnchor = postsAnchor || profileHeader();
+          if (postsBarAnchor) placeProfileBar("posts", postsBarAnchor, null, "");
+        }
+      }
 
       for (const [key, entry] of entries) {
-        if (!key.isConnected) {
-          entry.host.remove();
+        if (!key.isConnected || (entry.restore && !current.has(key))) {
+          if (entry.restore) entry.restore();
+          else entry.host.remove();
           entries.delete(key);
         } else if (!current.has(key) && entry.style) {
           entry.host.style.display = "none";
@@ -3047,10 +3268,15 @@
       }
     };
 
-    /* The highlight circle under the pointer. Moving onto its buttons keeps it. */
+    /* The highlight circle under the pointer. Moving onto its buttons keeps it. While anything
+       scrolls (the row of highlights itself, with Shift and the wheel), circles pass under a
+       still pointer one after another; a scan for each of them made scrolling stutter, so then
+       none is pointed at until the scrolling stops (onScrollForHighlight). */
     let hoveredHighlight = null;
+    let scrollEnd = null;
+    let rowScrolling = false;
     const onPointerOver = event => {
-      if (event.target.closest?.(HOST_TAG)) return;
+      if (scrollEnd || event.target.closest?.(HOST_TAG)) return;
       const link = event.target.closest?.(HIGHLIGHT_LINK) || null;
       if (link === hoveredHighlight) return;
       hoveredHighlight = link;
@@ -3097,7 +3323,9 @@
     };
     /* Worked out at once (only the bars on screen are checked), not in an animation frame,
        which a background tab never runs. */
-    const hoverSoon = () => updateHover();
+    const hoverSoon = () => {
+      if (!rowScrolling) updateHover();
+    };
     const onPointerMove = event => {
       pointer = event.pointerType === "touch" ? null : { x: event.clientX, y: event.clientY };
       hoverSoon();
@@ -3118,6 +3346,30 @@
     document.addEventListener("pointerout", onPointerOut, true);
     addEventListener("blur", onLeave);
     addEventListener("scroll", hoverSoon, { capture: true, passive: true });
+    /* Scrolling hides a highlight's buttons; 200 ms after it stops, the circle under the pointer
+       gets them again. While the row of highlights itself scrolls, nothing is scanned: Instagram
+       adds and removes circles as the row moves, and a scan after each change (or every 400 ms)
+       made the row stutter. One scan follows when it stops. */
+    const onScrollForHighlight = event => {
+      if (hoveredHighlight) {
+        hoveredHighlight = null;
+        safeScan();
+      }
+      const target = event.target;
+      if (target?.nodeType === 1 && target.querySelector(HIGHLIGHT_LINK)) rowScrolling = true;
+      clearTimeout(scrollEnd);
+      scrollEnd = setTimeout(() => {
+        scrollEnd = null;
+        const wasRow = rowScrolling;
+        rowScrolling = false;
+        const under = pointer && document.elementFromPoint(pointer.x, pointer.y);
+        const link = under && !under.closest(HOST_TAG) ? under.closest(HIGHLIGHT_LINK) : null;
+        const changed = !!link && link !== hoveredHighlight;
+        if (changed) hoveredHighlight = link;
+        if (changed || wasRow) safeScan();
+      }, 200);
+    };
+    addEventListener("scroll", onScrollForHighlight, { capture: true, passive: true });
 
     const safeScan = () => {
       try {
@@ -3131,7 +3383,7 @@
     /* A scan soon after Instagram changes the page or the page scrolls, at most every 150 ms. */
     let pending = null;
     const soon = () => {
-      if (!pending) pending = setTimeout(() => {
+      if (!pending && !rowScrolling) pending = setTimeout(() => {
         pending = null;
         safeScan();
       }, 150);
@@ -3158,6 +3410,7 @@
 
     safeScan();
     const timer = setInterval(() => {
+      if (rowScrolling) return;
       safeScan();
       repaintAll();
     }, 400);
@@ -3174,7 +3427,10 @@
         document.removeEventListener("pointerout", onPointerOut, true);
         removeEventListener("blur", onLeave);
         removeEventListener("scroll", hoverSoon, true);
+        removeEventListener("scroll", onScrollForHighlight, true);
+        clearTimeout(scrollEnd);
         layer.remove();
+        for (const entry of entries.values()) entry.restore ? entry.restore() : entry.host.remove();
         for (const node of document.querySelectorAll("[style*='--instagram-downloader-']")) node.style.removeProperty("anchor-name");
       },
     };
