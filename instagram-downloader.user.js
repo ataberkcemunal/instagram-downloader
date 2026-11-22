@@ -7,6 +7,7 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_listValues
+// @grant        GM_registerMenuCommand
 // @sandbox      raw
 // @inject-into  page
 // @run-at       document-idle
@@ -102,6 +103,10 @@
         for (const name of GM_listValues()) {
           if (name.startsWith("d:") && !keep(name.slice(2), GM_getValue(name, null))) GM_deleteValue(name);
         }
+        /* Details of downloads that are forgotten (a story after a day) go with them. */
+        for (const name of GM_listValues()) {
+          if (name.startsWith("i:") && !downloaded.has(name.slice(2))) GM_deleteValue(name);
+        }
       }
       const open = indexedDB.open("instagramDownloader", 1);
       open.onupgradeneeded = () => open.result.createObjectStore(STORE);
@@ -126,17 +131,62 @@
     return db;
   })();
 
-  function markDownloaded(key, story) {
+  /* details (optional): what was downloaded, for the list of downloads; see rememberDetails. */
+  function markDownloaded(key, story, details) {
     if (!key) return;
     const until = story ? Date.now() + DAY : null;
     downloaded.set(key, until);
     if (gm) {
       GM_setValue("d:" + key, until);
+      if (details) rememberDetails(key, details);
       return;
     }
     database.then(db => {
       if (db) db.transaction(STORE, "readwrite").objectStore(STORE).put(until, key);
     }).catch(error => console.warn("[Instagram Downloader] couldn't remember the download", error));
+  }
+
+  /* Forgets a download: its button is no longer red, and it leaves the list of downloads. */
+  function forgetDownload(key) {
+    downloaded.delete(key);
+    if (gm) {
+      GM_deleteValue("d:" + key);
+      GM_deleteValue("i:" + key);
+    } else {
+      database.then(db => {
+        if (db) db.transaction(STORE, "readwrite").objectStore(STORE).delete(key);
+      }).catch(() => {});
+    }
+    repaintAll();
+  }
+
+  /* What a download was, kept beside it in Tampermonkey's storage as "i:<key>": whose it is
+     (owner, name), its caption (text), a link to it, what was saved (kind), when (at), and a small
+     picture (thumb, kept as a file: Instagram's picture addresses stop working after a while),
+     made from details.picture. */
+  function rememberDetails(key, details) {
+    const { picture, ...kept } = details;
+    const record = { ...kept, at: Date.now() };
+    GM_setValue("i:" + key, record);
+    if (!picture || picture.startsWith("blob:")) return;
+    fetchBlob(picture)
+      .then(smallPicture)
+      .then(thumb => {
+        if (downloaded.has(key)) GM_setValue("i:" + key, { ...record, thumb });
+      })
+      .catch(error => console.warn("[Instagram Downloader] couldn't keep a small picture", error));
+  }
+
+  /* A picture at most 128 px on its longer side, as a JPEG data address (a few kB). */
+  async function smallPicture(blob) {
+    const bitmap = await createImageBitmap(blob);
+    const scale = Math.min(1, 128 / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    return canvas.toDataURL("image/jpeg", 0.7);
   }
   const LAYER_TAG = "instagram-downloader-layer";
   const RESERVED_PATHS = ["explore", "reels", "direct", "stories", "accounts", "p", "reel", "tv", "about", "legal"];
@@ -917,16 +967,20 @@
       /* What is being saved, named now: a carousel may have moved on by the time it is done. */
       let key = null;
       let story = false;
+      let details = null;
       try {
         key = done?.key();
         story = !!done?.story?.();
-      } catch (ignored) {}
+        details = done?.details?.() || null;
+      } catch (error) {
+        console.warn("[Instagram Downloader] couldn't describe the download", error);
+      }
       button.classList.add("busy");
       setIcon("busy");
       result.then(
         () => {
           /* Remembered, then painted at once, so the check mark already shows in red. */
-          markDownloaded(key, story);
+          markDownloaded(key, story, details);
           button.classList.remove("busy");
           button.repaint();
           setIcon("done");
@@ -1850,7 +1904,7 @@
     /* Saving from the tile's button or a "download all" button remembers it the same way. */
     tile.save = async () => {
       await save();
-      markDownloaded(media.key, story);
+      markDownloaded(media.key, story, media.details ? { ...media.details, picture: media.image } : null);
       tile.querySelector(HOST_TAG)?.shadowRoot?.querySelectorAll("button").forEach(button => button.repaint?.());
     };
     /* A video's first frame at the video's own resolution, from a copy of the video loaded with
@@ -1883,7 +1937,9 @@
       ["open", "Open in new tab", openOne],
       ...(media.video && story ? [["frame", "Download first frame as a photo", saveFrame]] : []),
       ...(media.video && media.image && withCover ? [["cover", "Download cover", saveCover]] : []),
-      ["download", media.video ? "Download video" : "Download photo", save, media.key ? { key: () => media.key, story: () => story } : null],
+      ["download", media.video ? "Download video" : "Download photo", save, media.key ? {
+        key: () => media.key, story: () => story, details: () => media.details ? { ...media.details, picture: media.image } : null,
+      } : null],
     ]]]);
     tile.append(host);
 
@@ -2075,7 +2131,10 @@
       const repeat = (used.get(name) || 0) + 1;
       used.set(name, repeat);
       if (repeat > 1) name += " " + repeat;
-      return mediaTile(tab, media, name, media.video ? "Video" : "", { story: true });
+      const details = { owner: node.user?.username || "", name: node.user?.full_name || "",
+        text: node.title ? "Highlight · " + node.title : "", kind: media.video ? "Story video" : "Story photo",
+        link: "https://www.instagram.com/stories/highlights/" + entry.id + "/" };
+      return mediaTile(tab, { ...media, details }, name, media.video ? "Video" : "", { story: true });
     });
     entry.grid.append(...tiles);
     if (tiles.length) addDownloadAll(tab, entry, "Download the cover and all stories of this highlight");
@@ -2235,7 +2294,11 @@
       const name = base + " " + stamp + (items.length > 1 ? " " + (index + 1) : "");
       const label = (items.length > 1 ? index + 1 + "/" + items.length : "") +
         (media.video ? (items.length > 1 ? " · " : "") + "Video" : "");
-      grid.append(mediaTile(tab, { ...media, taken }, name, label, { withCover: true }));
+      const user = node.user || node.owner;
+      const details = { owner: user?.username || "", name: user?.full_name || "", text: caption,
+        kind: (media.video ? "Video" : "Photo") + (items.length > 1 ? " " + (index + 1) + "/" + items.length : ""),
+        link: node.code ? "https://www.instagram.com/p/" + node.code + "/" : "" };
+      grid.append(mediaTile(tab, { ...media, taken, details }, name, label, { withCover: true }));
     });
     addDownloadAll(tab, { head, grid }, items.length > 1 ? "Download all photos and videos of this post" : "Download", "tab small");
     return items.length;
@@ -2711,7 +2774,31 @@
     mediaKey(media);
     return !!mediaKeys.get(media)?.story;
   };
-  const mediaDone = media => ({ key: () => mediaKey(media), story: () => mediaIsStory(media) });
+  const mediaDone = media => ({ key: () => mediaKey(media), story: () => mediaIsStory(media), details: () => mediaDetails(media) });
+
+  /* What a photo or video on the page is, for the list of downloads: its post (the nearest media
+     object with the post's code, or with an owner), whose it is, its caption, which photo of a
+     multi-photo post, and a link (the post, or the story's address). */
+  function mediaDetails(media) {
+    const video = media.tagName === "VIDEO";
+    const item = video ? findVideoItem(media) : findImageItem(media);
+    const around = collectMediaItems(media, 30).map(found => found.item);
+    const code = item?.code || postCodeOf(media);
+    const post = around.find(other => code && other.code === code) || around.find(other => other.carousel_media?.some(child => child.pk === item?.pk)) || item;
+    const user = post?.user || post?.owner || item?.user || item?.owner;
+    const story = mediaIsStory(media);
+    const owner = user?.username || location.pathname.match(/^\/stories\/(?!highlights\/)([^/]+)\//)?.[1] || profileOfPage() || "";
+    const children = post?.carousel_media || [];
+    const index = item ? children.findIndex(child => child.pk === item.pk) : -1;
+    const kind = (story ? "Story " : "") + (video ? (story ? "video" : "Video") : story ? "photo" : "Photo") +
+      (index >= 0 && children.length > 1 ? " " + (index + 1) + "/" + children.length : "");
+    const smallest = item?.image_versions2?.candidates?.slice(-1)[0]?.url;
+    return {
+      owner, name: user?.full_name || "", text: (post?.caption?.text || "").trim(), kind,
+      link: !story && code ? "https://www.instagram.com/p/" + code + "/" : location.href,
+      picture: smallest || (video ? media.poster : media.currentSrc || media.src) || "",
+    };
+  }
 
   /* Open, first frame (story videos only) and download, for one photo or video. A cover button
      is only on previews: tiles linking to their post, Reel tiles and the posts gallery. */
@@ -2734,8 +2821,11 @@
     const bars = kind === "avatar"
       ? [
         ["avatar-left", [["open", "Open in new tab", () => openAvatar(media)]]],
-        ["avatar-right", [["download", "Download profile picture", () => downloadAvatar(media),
-          { key: () => "u:" + (profileOfPage() || "") }]]],
+        ["avatar-right", [["download", "Download profile picture", () => downloadAvatar(media), {
+          key: () => "u:" + (profileOfPage() || ""),
+          details: () => ({ owner: profileOfPage() || "", kind: "Profile picture",
+            link: "https://www.instagram.com/" + (profileOfPage() || "") + "/", picture: media.currentSrc || media.src }),
+        }]]],
       ]
       : kind === "reelTile"
         ? [["post", [
@@ -2745,6 +2835,12 @@
             key: () => {
               const code = media.getAttribute("href")?.match(/\/reel\/([A-Za-z0-9_-]+)/)?.[1];
               return code ? "m:" + shortcodeToPk(code) : null;
+            },
+            details: () => {
+              const code = media.getAttribute("href")?.match(/\/reel\/([A-Za-z0-9_-]+)/)?.[1];
+              const cover = media.querySelector("img");
+              return { owner: profileOfPage() || "", kind: "Reel", link: code ? "https://www.instagram.com/reel/" + code + "/" : "",
+                picture: cover ? cover.currentSrc || cover.src : "" };
             },
           }],
         ]]]
@@ -3446,6 +3542,298 @@
     setTimeout(() => note.remove(), 2500);
   }
 
+  /* ---------- The list of downloads ---------- */
+
+  /* A panel over the page (opened from Tampermonkey's menu) listing what was downloaded, newest
+     first: a small picture, whose it is, what was saved, the caption, when, a link to it and a
+     button that forgets it (its button is no longer red). A search box filters the list.
+     Downloads from before details were kept show what their key tells: what kind, and a link
+     when one can be made. Several downloads of one post (its photos) share one line. */
+  const PANEL_CSS = [
+    ":host{all:initial;position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;background:rgba(0,0,0,.6);",
+    "font:14px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#e8e8e8}",
+    ".panel{width:min(880px,calc(100vw - 32px));height:min(82vh,920px);display:flex;flex-direction:column;background:#161616;",
+    "border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.55),inset 0 0 0 1px rgba(255,255,255,.06);overflow:hidden}",
+    "header{display:flex;align-items:center;gap:12px;padding:16px 18px;border-bottom:1px solid #262626}",
+    "h2{margin:0;font-size:17px;font-weight:600;color:#fff;white-space:nowrap}",
+    ".count{color:#888;font-size:13px;white-space:nowrap}",
+    "input{flex:1;min-width:0;box-sizing:border-box;background:#222;border:1px solid #2e2e2e;border-radius:999px;padding:8px 14px;",
+    "color:#eee;font:inherit;outline:none}",
+    "input:focus{border-color:#555}",
+    "button{all:unset;box-sizing:border-box;cursor:pointer;display:grid;place-items:center;border-radius:50%;flex:none}",
+    "button:focus-visible{outline:2px solid currentColor;outline-offset:1px}",
+    ".close{width:32px;height:32px;color:#aaa}",
+    ".close:hover{background:#262626;color:#fff}",
+    "svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}",
+    ".list{flex:1;overflow:auto;padding:4px 8px 14px}",
+    ".section{padding:16px 10px 6px;color:#888;font-size:12px;font-weight:600;letter-spacing:.03em}",
+    ".row{display:flex;align-items:center;gap:12px;padding:8px 10px;border-radius:10px}",
+    ".row:hover{background:#1f1f1f}",
+    ".thumb{width:48px;height:64px;flex:none;border-radius:8px;background:#262626 center/cover no-repeat;display:grid;place-items:center;color:#555}",
+    ".thumb.round{height:48px;border-radius:50%}",
+    ".main{flex:1;min-width:0}",
+    ".top{display:flex;align-items:center;gap:8px;min-width:0}",
+    ".owner{font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+    ".kind{flex:none;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;color:var(--accent);background:var(--accent-bg)}",
+    ".text{color:#999;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}",
+    ".when{flex:none;color:#777;font-size:12px;text-align:right;white-space:nowrap}",
+    "a{flex:none;color:#8ab4f8;text-decoration:none;font-size:13px;white-space:nowrap}",
+    "a:hover{text-decoration:underline}",
+    ".remove{width:30px;height:30px;color:#666}",
+    ".remove:hover{background:#2a2a2a;color:#ff6b6b}",
+    ".remove svg{width:16px;height:16px}",
+    ".more{margin:12px auto 0;padding:8px 16px;border-radius:999px;background:#222;color:#ddd;display:block;width:max-content}",
+    ".more:hover{background:#2a2a2a}",
+    ".empty{padding:48px 16px;text-align:center;color:#777}",
+  ].join("");
+
+  const PANEL_ICONS = {
+    close: ["M6 6l12 12", "M18 6 6 18"],
+    remove: ["M4.5 7h15", "M9.5 7V5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v2", "M6.5 7l1 12a1.5 1.5 0 0 0 1.5 1.5h6a1.5 1.5 0 0 0 1.5-1.5l1-12"],
+    picture: ["M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z", "m20 15-5-5L5 20"],
+  };
+  function panelIcon(name) {
+    const namespace = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(namespace, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    for (const data of PANEL_ICONS[name]) {
+      const path = document.createElementNS(namespace, "path");
+      path.setAttribute("d", data);
+      svg.append(path);
+    }
+    return svg;
+  }
+
+  const PAGE_SIZE = 150;
+
+  /* site: { title, accent, accentBg, groupOf(key, details), describeKey(key) → { kind, link, round, id },
+     kindOf(kinds) }. */
+  function openDownloads(site) {
+    if (document.querySelector(HOST_TAG + "[data-panel]")) return;
+    const records = [...downloaded.keys()].filter(isDownloaded).map(key => ({
+      key,
+      info: gm ? GM_getValue("i:" + key, null) : null,
+    }));
+    /* One line per post: the newest download of it leads, the others add what they saved. */
+    const groups = new Map();
+    for (const record of records) {
+      const id = site.groupOf(record.key, record.info);
+      const group = groups.get(id) || { keys: [], records: [] };
+      group.keys.push(record.key);
+      group.records.push(record);
+      groups.set(id, group);
+    }
+    const lines = [...groups.values()].map(group => {
+      group.records.sort((a, b) => (b.info?.at || 0) - (a.info?.at || 0));
+      const lead = group.records.find(record => record.info) || group.records[0];
+      const fallback = site.describeKey(lead.key);
+      const info = lead.info || {};
+      const kinds = [...new Set(group.records.map(record => record.info?.kind || site.describeKey(record.key).kind))];
+      const owner = info.owner ? (info.name && info.name.toLowerCase() !== info.owner.toLowerCase() ? info.owner + " (" + info.name + ")" : info.owner) : "";
+      return {
+        keys: group.keys,
+        at: info.at || 0,
+        owner,
+        text: info.text || "",
+        kind: site.kindOf ? site.kindOf(kinds) : kinds.join(", "),
+        link: info.link || fallback.link || "",
+        thumb: group.records.map(record => record.info?.thumb).find(Boolean) || "",
+        round: fallback.round,
+        id: fallback.id || "",
+      };
+    }).sort((a, b) => b.at - a.at);
+
+    const host = document.createElement(HOST_TAG);
+    host.dataset.panel = "";
+    host.style.setProperty("--accent", site.accent);
+    host.style.setProperty("--accent-bg", site.accentBg);
+    const root = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = PANEL_CSS;
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", site.title);
+    const header = document.createElement("header");
+    const title = document.createElement("h2");
+    title.textContent = site.title;
+    const count = document.createElement("span");
+    count.className = "count";
+    const search = document.createElement("input");
+    search.type = "search";
+    search.placeholder = "Search by account, caption or kind";
+    const close = document.createElement("button");
+    close.className = "close";
+    close.title = "Close (Esc)";
+    close.setAttribute("aria-label", "Close");
+    close.append(panelIcon("close"));
+    header.append(title, count, search, close);
+    const list = document.createElement("div");
+    list.className = "list";
+    panel.append(header, list);
+    root.append(style, panel);
+
+    let shown = PAGE_SIZE;
+    const matching = () => {
+      const words = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+      return lines.filter(line => {
+        const text = (line.owner + " " + line.text + " " + line.kind + " " + line.id).toLowerCase();
+        return words.every(word => text.includes(word));
+      });
+    };
+    const render = () => {
+      const found = matching();
+      count.textContent = found.length === lines.length ? lines.length + "" : found.length + " of " + lines.length;
+      list.textContent = "";
+      if (!found.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = lines.length ? "Nothing matches the search." : "Nothing has been downloaded yet.";
+        list.append(empty);
+        return;
+      }
+      let section = null;
+      for (const line of found.slice(0, shown)) {
+        const name = line.at ? new Date(line.at).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })
+          : "Earlier (no details were kept)";
+        if (name !== section) {
+          section = name;
+          const heading = document.createElement("div");
+          heading.className = "section";
+          heading.textContent = name;
+          list.append(heading);
+        }
+        list.append(renderLine(line));
+      }
+      if (found.length > shown) {
+        const more = document.createElement("button");
+        more.className = "more";
+        more.textContent = "Show " + Math.min(PAGE_SIZE, found.length - shown) + " more";
+        more.addEventListener("click", () => {
+          shown += PAGE_SIZE;
+          render();
+        });
+        list.append(more);
+      }
+    };
+    const renderLine = line => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const thumb = document.createElement("div");
+      thumb.className = "thumb" + (line.round ? " round" : "");
+      if (line.thumb) thumb.style.backgroundImage = "url(\"" + line.thumb + "\")";
+      else thumb.append(panelIcon("picture"));
+      const main = document.createElement("div");
+      main.className = "main";
+      const top = document.createElement("div");
+      top.className = "top";
+      const owner = document.createElement("span");
+      owner.className = "owner";
+      owner.textContent = line.owner || line.id;
+      const kind = document.createElement("span");
+      kind.className = "kind";
+      kind.textContent = line.kind;
+      top.append(owner, kind);
+      main.append(top);
+      if (line.text) {
+        const text = document.createElement("div");
+        text.className = "text";
+        text.textContent = line.text;
+        text.title = line.text;
+        main.append(text);
+      }
+      const when = document.createElement("span");
+      when.className = "when";
+      if (line.at) {
+        when.textContent = new Date(line.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+        when.title = new Date(line.at).toLocaleString();
+      }
+      row.append(thumb, main, when);
+      if (line.link) {
+        const link = document.createElement("a");
+        link.href = line.link;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = "Open ↗";
+        row.append(link);
+      }
+      const remove = document.createElement("button");
+      remove.className = "remove";
+      remove.title = "Forget this download (its button is no longer red; the file stays)";
+      remove.setAttribute("aria-label", remove.title);
+      remove.append(panelIcon("remove"));
+      remove.addEventListener("click", () => {
+        for (const key of line.keys) forgetDownload(key);
+        lines.splice(lines.indexOf(line), 1);
+        row.remove();
+        const found = matching().length;
+        count.textContent = found === lines.length ? lines.length + "" : found + " of " + lines.length;
+      });
+      row.append(remove);
+      return row;
+    };
+
+    const shut = () => {
+      host.remove();
+      document.removeEventListener("keydown", onKey, true);
+    };
+    const onKey = event => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        shut();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    close.addEventListener("click", shut);
+    host.addEventListener("click", event => {
+      if (event.composedPath()[0] === host) shut();
+    });
+    /* Keys typed in the search box don't reach the site (which would pause a video or scroll). */
+    for (const type of ["keydown", "keyup", "keypress"]) host.addEventListener(type, event => event.stopPropagation());
+    search.addEventListener("input", () => {
+      shown = PAGE_SIZE;
+      render();
+    });
+    render();
+    document.documentElement.append(host);
+    search.focus();
+  }
+
+  /* Converts Instagram's numeric media id back to a post code (/p/CODE/). */
+  function pkToShortcode(pk) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let number = BigInt(pk);
+    let code = "";
+    while (number > 0n) {
+      code = alphabet[Number(number % 64n)] + code;
+      number /= 64n;
+    }
+    return code;
+  }
+
+  /* How Instagram's downloads are listed: the photos and videos of one post share a line. */
+  const DOWNLOADS_SITE = {
+    title: "Instagram downloads",
+    accent: "#ff3040",
+    accentBg: "rgba(255,48,64,.16)",
+    groupOf: (key, details) => /\/p\//.test(details?.link || "") ? details.link : key,
+    describeKey: key => {
+      const [type, ...rest] = key.split(":");
+      const id = rest.join(":");
+      if (type === "u") return { kind: "Profile picture", link: "https://www.instagram.com/" + id + "/", round: true, id: "@" + id };
+      if (type === "h") return { kind: "Highlight cover", link: "https://www.instagram.com/stories/highlights/" + id + "/", round: true, id };
+      if (type === "f") return { kind: "Photo", link: "", id: id.split("?")[0].slice(0, 40) };
+      let code = "";
+      try {
+        code = pkToShortcode(id);
+      } catch (ignored) {}
+      return { kind: "Photo or video", link: code ? "https://www.instagram.com/p/" + code + "/" : "", id: code || id };
+    },
+    /* Many photos of one post are counted. */
+    kindOf: kinds => kinds.length > 3 ? kinds.length + " photos and videos" : kinds.join(", "),
+  };
+
   /* ---------- Start ---------- */
 
   /* Each bookmarklet click turns the buttons on or off. */
@@ -3459,6 +3847,10 @@
       window.__instagramDownloader = null;
       toast("Instagram Downloader is off.");
       return;
+    }
+    if (typeof GM_registerMenuCommand === "function" && !window.__instagramDownloaderMenu) {
+      window.__instagramDownloaderMenu = true;
+      GM_registerMenuCommand("Downloads", () => openDownloads(DOWNLOADS_SITE));
     }
     window.__instagramDownloader = startButtons();
     if (!AUTO_START) toast("Instagram Downloader is on. Click the bookmarklet again to turn it off.");

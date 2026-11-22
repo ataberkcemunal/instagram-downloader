@@ -20,6 +20,10 @@ highlights and profile pictures, at the largest size Instagram has.
   highlight in a new tab, with its uncropped cover and all its stories.
 - **Remembers downloads**: a Download button turns red once that photo or video has been saved
   (stories are remembered for a day, everything else for good).
+- **List of downloads**: choose **Downloads** in Tampermonkey's menu to see everything you
+  downloaded, newest first. Each line has a small picture, the account, the caption, the time
+  and a link, and the list can be searched. Forgetting a line makes its button plain again; the
+  file stays where it is.
 
 ## Install
 
