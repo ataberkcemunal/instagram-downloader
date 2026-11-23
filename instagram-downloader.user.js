@@ -850,8 +850,6 @@
     open: ["M11 4.5H6.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V13", "M14.5 3.5h6v6", "m20.5 3.5-9 9"],
     /* A bare arrow pointing up and right: the same, for the round All posts button. */
     arrow: ["M6.5 17.5 17.5 6.5", "M8.5 6.5h9v9"],
-    /* Two photos, one behind the other: all posts, with every photo of multi-photo posts. */
-    stack: ["M8.5 7.5h10a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-10a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z", "M3.5 15.5v-10a2 2 0 0 1 2-2h10", "m6.5 17.5 3.8-3.8a1.5 1.5 0 0 1 2.1 0l4 4"],
     /* A highlight circle: all highlights. */
     ring: ["M12 3.5a8.5 8.5 0 1 1 0 17 8.5 8.5 0 0 1 0-17z", "M12 7.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9z"],
     busy: ["M12 3a9 9 0 1 0 9 9"],
@@ -2442,12 +2440,10 @@
     return "below-end";
   }
 
-  /* A one-button bar, on the same frosted pill as the other floating bars: all posts ("posts"), or
-     all highlights ("highlights") of the profile with that row of highlights (tray). */
-  function buildProfileBarHost(which, tray) {
-    const button = which === "posts"
-      ? ["stack", "All posts in a new tab, with every photo of multi-photo posts", () => openAllPosts()]
-      : ["ring", "All highlights in a new tab", () => openAllHighlights(tray)];
+  /* A one-button bar, on the same frosted pill as the other floating bars: all highlights of the
+     profile with that row of highlights (tray), where the circle can't be put in the row. */
+  function buildProfileBarHost(tray) {
+    const button = ["ring", "All highlights in a new tab", () => openAllHighlights(tray)];
     const host = makeHost(window, PILL_CSS, [["tab profile", [button]]]);
     isolateEvents(host);
     return host;
@@ -3261,19 +3257,20 @@
       }
       /* The profile's All highlights and All posts buttons, each on what it opens: a circle
          first in the row of highlights, and a round button beside the Posts tab's icon. Where
-         that can't be done (Instagram's layout has changed, or there are no tabs), a small bar
-         beside the row of highlights, the row of tabs or the header. No All posts button for an
-         account without posts or a private account the viewer doesn't follow, nor while that
-         isn't known yet, so it doesn't appear and then go away. A bar is shown while nothing (a
-         story or post window) covers its anchor, and where it goes is worked out once per anchor
-         and width, so it doesn't move about. */
-      const placeProfileBar = (which, anchor, tray, extraStyle) => {
+         the circle can't be put in the row (Instagram's layout has changed), a small bar beside
+         the row instead. All posts is shown only beside the Posts tab: a private account the
+         viewer doesn't follow and an account without posts have no tabs, so they get no button
+         (asking Instagram whether an account is private can fail). It also waits for that answer,
+         so it doesn't appear and then go away. A bar is shown while nothing (a story or post
+         window) covers its anchor, and where it goes is worked out once per anchor and width, so
+         it doesn't move about. */
+      const placeProfileBar = (anchor, tray, extraStyle) => {
         const rect = isNearScreen(anchor) && isShown(anchor, false) ? visibleRect(anchor) : null;
         if (!isNearScreen(anchor) || !isShown(anchor, false) || (rect && !isUncovered(anchor, ...centreOf(rect)))) return null;
         current.add(anchor);
         let entry = entries.get(anchor);
         if (!entry) {
-          entry = { kind: "profile", host: buildProfileBarHost(which, tray), style: null };
+          entry = { kind: "profile", host: buildProfileBarHost(tray), style: null };
           entries.set(anchor, entry);
           layer.append(entry.host);
         }
@@ -3296,10 +3293,9 @@
         return placement;
       };
       const tray = highlightTray();
-      const postsAnchor = firstProfileTab() || (tray ? null : profileHeader());
-      const onProfile = !!(tray || postsAnchor || profileHeader());
+      const onProfile = !!(tray || profileHeader());
       const access = onProfile ? canSeePosts(profileOfPage(), soon) : null;
-      const withPosts = !!access && !headerSaysNoPosts() && !!(postsAnchor || profileHeader());
+      const withPosts = !!access && !headerSaysNoPosts();
 
       /* The circle goes into Instagram's own page, in the frame around the row of highlights, so
          it is covered by whatever covers them. It is put back only when it isn't in place, as
@@ -3335,7 +3331,7 @@
           }
         }
       } else if (tray) {
-        placeProfileBar("highlights", tray, tray, "");
+        placeProfileBar(tray, tray, "");
       }
 
       if (withPosts) {
@@ -3350,9 +3346,6 @@
             layer.append(entry.host);
           }
           show(entry, postsIcon, "side", 8, ";color:" + getComputedStyle(postsIcon).color);
-        } else if (!postsIcon) {
-          const postsBarAnchor = postsAnchor || profileHeader();
-          if (postsBarAnchor) placeProfileBar("posts", postsBarAnchor, null, "");
         }
       }
 
